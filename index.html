@@ -187,6 +187,8 @@ input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; poin
       <label class="btn primary" for="pdf">Importer un relevé PDF</label>
       <input type="file" id="pdf" accept=".pdf,application/pdf" multiple>
       <label class="btn" for="csv" id="csvlabel">Importer un CSV</label>
+      <label class="btn" for="pdfAnon">Anonymiser un relevé PDF</label>
+      <input type="file" id="pdfAnon" accept=".pdf,application/pdf">
       <input type="file" id="csv" accept=".csv,text/csv,text/plain">
       <button class="btn" type="button" id="resetBudgets">Budgets proposés</button>
       <button class="btn" type="button" id="resetImports">Effacer les imports</button>
@@ -195,6 +197,7 @@ input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; poin
       <input type="file" id="json" accept=".json,application/json">
     </div>
     <p class="msg" id="msg" role="status"></p>
+    <div id="anonout"></div>
     <div class="foot">
       <p>Relevés PDF Boursobank, ou export CSV (colonnes dateOp, label, amount) : les opérations déjà présentes sont ignorées. Pour un PDF, l'application vérifie que le total correspond aux soldes du relevé.</p>
       <p>Hors budget : les transferts entre tes comptes et les virements avec des proches. Si l'un d'eux est une vraie dépense, reclasse-le depuis sa ligne.</p>
@@ -258,7 +261,7 @@ var RULES = [
 function cleanLabel(label) {
   return String(label)
     .replace(/^CARTE\s+\d{2}\/\d{2}\/\d{2}\s+/i, '')
-    .replace(/\s*CB\*\d+\s*$/i, '')
+    .replace(/\s*CB\*[\dX]+\s*$/i, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -681,7 +684,7 @@ var StatementParser = (function () {
 
   function cleanContinuation(text) {
     if (/^(R[èe]f|RUM)\b/i.test(text)) return '';
-    return text.split(/\s+/).filter(function (t) { return t && !/\d{5,}/.test(t); }).join(' ');
+    return text.split(/\s+/).filter(function (t) { return t && !/\d{5,}|^X{4,}$/.test(t); }).join(' ');
   }
 
   function parse(pages, clean) {
@@ -750,6 +753,149 @@ var StatementParser = (function () {
 })();
 
 if (typeof module !== 'undefined') module.exports = StatementParser;
+// Anonymisation d'un relevé Boursobank : les éléments d'identité et les numéros techniques sont remplacés par XXXX,
+// puis un nouveau PDF est reconstruit à partir du texte masqué (l'original n'est jamais recopié, aucune métadonnée).
+// Entrée : pages = [{ w, h, items: [{ s, x, y, w, size }] }].
+var Anonymizer = (function () {
+  var MASK = 'XXXX';
+
+  function longCode(tok) {
+    if (/^-?[\d.]+,\d+$/.test(tok)) return false;
+    if (/\d{6,}/.test(tok)) return true;
+    var digits = (tok.match(/\d/g) || []).length;
+    return tok.length >= 10 && digits >= 6 && !/[\/,]/.test(tok);
+  }
+
+  function maskTokens(s) {
+    return s.split(/(\s+)/).map(function (t) { return longCode(t) ? MASK : t; }).join('');
+  }
+
+  // Renvoie { pages: pages masquées, secrets: textes d'origine à ne plus jamais retrouver }
+  function mask(pages) {
+    var secrets = [];
+    function keep(s) { var k = s.replace(/\s+/g, ''); if (k.length >= 5) secrets.push(k); }
+    var out = pages.map(function (page, idx) {
+      var ribY = null, bicY = null, nameY = null;
+      page.items.forEach(function (i) {
+        var t = i.s.trim();
+        if (/^du(\s+\d{2}\/\d{2}\/\d{4})?(\s+au(\s+\d{2}\/\d{2}\/\d{4})?)?$/.test(t) && i.x > 285 && i.x < 305 && i.y > 110) ribY = i.y;
+        if (/^B\.I\.C\./.test(t)) bicY = i.y;
+        if (idx === 0 && i.x > 300 && i.y > 560 && i.y < 700 && t === 'M') nameY = i.y;
+      });
+      var groups = {};
+      function group(y, text) { var k = Math.round(y); groups[k] = (groups[k] || '') + text; }
+      var items = page.items.map(function (i) {
+        var t = i.s, u = t.trim(), m = t, hit = false, drop = false;
+        if (idx === 0 && i.x > 300 && i.y > 560 && i.y < 700) {
+          hit = true; drop = u.length <= 2;
+          if (nameY === null || Math.abs(i.y - nameY) > 3) group(i.y, u);
+        } else if (ribY !== null && Math.abs(i.y - ribY) < 3 && i.x < 290 && /^\d+$/.test(u)) {
+          hit = true; keep(u);
+        } else if (bicY !== null && Math.abs(i.y - bicY) < 3 && !/^(B\.I\.C\.|I\.B\.A\.N\.)$/.test(u)) {
+          hit = true; group(i.y, u);
+        } else if (/^[A-Z]{2}\d{2}(\s?[A-Z0-9]{4}){3,}\s?[A-Z0-9]{0,3}$/.test(u)) {
+          hit = true; keep(u);
+        } else {
+          m = t.replace(/CB\*(\d+)/g, function (all) { keep(all); return 'CB*' + MASK; });
+          if (i.y > 105) {
+            var m2 = maskTokens(m);
+            if (m2 !== m) { m.split(/\s+/).forEach(function (tok) { if (longCode(tok)) keep(tok); }); m = m2; }
+          }
+        }
+        if (hit) m = drop ? '' : MASK;
+        return { s: m, x: i.x, y: i.y, w: m === t ? i.w : 0, size: i.size };
+      });
+      Object.keys(groups).forEach(function (k) { keep(groups[k]); });
+      return { w: page.w, h: page.h, items: items };
+    });
+    return { pages: out, secrets: secrets };
+  }
+
+  // Octets WinAnsi (cp1252) d'un texte ; caractère inconnu → ?
+  var CP1252 = { 0x20AC: 0x80, 0x201A: 0x82, 0x0192: 0x83, 0x201E: 0x84, 0x2026: 0x85, 0x2020: 0x86, 0x2021: 0x87, 0x02C6: 0x88, 0x2030: 0x89, 0x0160: 0x8A, 0x2039: 0x8B, 0x0152: 0x8C, 0x017D: 0x8E, 0x2018: 0x91, 0x2019: 0x92, 0x201C: 0x93, 0x201D: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97, 0x02DC: 0x98, 0x2122: 0x99, 0x0161: 0x9A, 0x203A: 0x9B, 0x0153: 0x9C, 0x017E: 0x9E, 0x0178: 0x9F };
+  function hex(s) {
+    var h = '';
+    for (var k = 0; k < s.length; k++) {
+      var c = s.charCodeAt(k), b = CP1252[c] || (c < 256 ? c : 63);
+      if (b < 32) b = 32;
+      h += (b < 16 ? '0' : '') + b.toString(16);
+    }
+    return h;
+  }
+  var HW = [278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584];
+  function natural(str, size) {
+    var t = 0;
+    for (var k = 0; k < str.length; k++) {
+      var c = str.charCodeAt(k);
+      if (c < 32 || c > 126) { var b = str.charAt(k).normalize('NFD').charCodeAt(0); c = (b >= 32 && b <= 126) ? b : 0; }
+      t += c ? HW[c - 32] : 556;
+    }
+    return t * size / 1000;
+  }
+  function num(v) { return (Math.round(v * 100) / 100).toString(); }
+
+  function build(pages) {
+    var objs = [];
+    objs[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+    var kids = pages.map(function (p, i) { return (5 + 2 * i) + ' 0 R'; }).join(' ');
+    objs[2] = '<< /Type /Pages /Kids [' + kids + '] /Count ' + pages.length + ' >>';
+    objs[3] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>';
+    objs[4] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>';
+    pages.forEach(function (p, i) {
+      var c = '';
+      p.items.forEach(function (it) {
+        if (!it.s) return;
+        var size = it.size > 0 ? it.size : 8;
+        var nat = natural(it.s, size), tz = (it.w && nat > 0) ? Math.max(50, Math.min(200, 100 * it.w / nat)) : 100;
+        c += 'BT /F' + (size >= 11 ? 2 : 1) + ' ' + num(size) + ' Tf ' + num(tz) + ' Tz 1 0 0 1 ' + num(it.x) + ' ' + num(it.y) + ' Tm <' + hex(it.s) + '> Tj ET\n';
+      });
+      objs[5 + 2 * i] = '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ' + num(p.w) + ' ' + num(p.h) + '] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ' + (6 + 2 * i) + ' 0 R >>';
+      objs[6 + 2 * i] = '<< /Length ' + c.length + ' >>\nstream\n' + c + 'endstream';
+    });
+    var s = '%PDF-1.4\n', offs = [];
+    for (var n = 1; n < objs.length; n++) { offs[n] = s.length; s += n + ' 0 obj\n' + objs[n] + '\nendobj\n'; }
+    var xref = s.length;
+    s += 'xref\n0 ' + objs.length + '\n0000000000 65535 f \n';
+    for (var k = 1; k < objs.length; k++) s += ('0000000000' + offs[k]).slice(-10) + ' 00000 n \n';
+    s += 'trailer\n<< /Size ' + objs.length + ' /Root 1 0 R >>\nstartxref\n' + xref + '\n%%EOF\n';
+    var bytes = new Uint8Array(s.length);
+    for (var j = 0; j < s.length; j++) bytes[j] = s.charCodeAt(j) & 255;
+    return bytes;
+  }
+
+  // Contrôle indépendant du masquage : liste ce qui ressemble encore à une donnée personnelle ou à un numéro technique,
+  // même si le masquage ne l'a pas vu. Sert de garde-fou avant de proposer le fichier.
+  function residual(pages) {
+    var found = [];
+    pages.forEach(function (p) {
+      var all = p.items.map(function (i) { return i.s.trim(); }).join(' ');
+      var flat = all.replace(/\s+/g, '');
+      var m = flat.match(/[A-Z]{2}\d{16,}/g) || [];
+      m.forEach(function (x) { found.push('IBAN ' + x.slice(0, 6) + '…'); });
+      if (/CB\*\d/.test(all)) found.push('numéro de carte');
+      p.items.forEach(function (i) {
+        var t = i.s.trim();
+        if (/^-?[\d.]+,\d+(\s*[%¤])?$/.test(t)) return;
+        if (/\d{6,}/.test(t) || (/^\d{5}$/.test(t) && i.x < 290 && i.y > 110)) found.push('numéro ' + t.slice(0, 2) + '…');
+      });
+    });
+    return found;
+  }
+
+  // Liste des secrets encore présents dans le texte des pages
+  function leaks(pages, secrets) {
+    var found = [];
+    pages.forEach(function (p) {
+      var all = p.items.map(function (i) { return i.s.replace(/\s+/g, ''); }).join('');
+      secrets.forEach(function (s) { if (all.indexOf(s) >= 0 && found.indexOf(s) < 0) found.push(s); });
+    });
+    return found;
+  }
+
+  return { mask: mask, build: build, leaks: leaks, residual: residual };
+})();
+
+if (typeof module !== 'undefined') module.exports = Anonymizer;
 
 // ---------- Import des relevés PDF ----------
 // Une opération est considérée comme déjà présente si une opération de même date et de même montant existe.
@@ -784,7 +930,7 @@ function loadPdfJs() {
   });
 }
 
-function readPages(file) {
+function readRaw(file) {
   return loadPdfJs().then(function (lib) {
     return file.arrayBuffer().then(function (buf) {
       return lib.getDocument({ data: new Uint8Array(buf) }).promise;
@@ -793,17 +939,25 @@ function readPages(file) {
     var pages = [], chain = Promise.resolve();
     for (var n = 1; n <= doc.numPages; n++) {
       (function (num) {
+        var view = null;
         chain = chain.then(function () { return doc.getPage(num); })
-          .then(function (page) { return page.getTextContent(); })
+          .then(function (page) { view = page.view; return page.getTextContent(); })
           .then(function (tc) {
-            pages.push(tc.items.filter(function (i) { return i.str && i.str.trim(); }).map(function (i) {
-              return { s: i.str, x: i.transform[4], y: i.transform[5], w: i.width };
-            }));
+            pages.push({
+              w: view[2] - view[0], h: view[3] - view[1],
+              items: tc.items.filter(function (i) { return i.str && i.str.trim(); }).map(function (i) {
+                return { s: i.str, x: i.transform[4], y: i.transform[5], w: i.width, size: Math.sqrt(i.transform[0] * i.transform[0] + i.transform[1] * i.transform[1]) };
+              })
+            });
           });
       })(n);
     }
     return chain.then(function () { return pages; });
   });
+}
+
+function readPages(file) {
+  return readRaw(file).then(function (pages) { return pages.map(function (p) { return p.items; }); });
 }
 
 function importStatement(file) {
@@ -862,6 +1016,62 @@ function proposeBudgetsFromExtra() {
 
 document.getElementById('resetBudgets').addEventListener('click', function () {
   if (!base.length && extra.length) { proposeBudgetsFromExtra(); render(); }
+});
+
+// ---------- Anonymisation d'un relevé PDF ----------
+var anonUrl = null;
+
+function anonymizeStatement(file) {
+  return readRaw(file).then(function (raw) {
+    var before = StatementParser.parse(raw.map(function (p) { return p.items; }), cleanLabel);
+    if (!before.rows.length) throw new Error('relevé de compte Boursobank attendu.');
+    var m = Anonymizer.mask(raw);
+    var bytes = Anonymizer.build(m.pages);
+    var blob = new Blob([bytes], { type: 'application/pdf' });
+    return readRaw(blob).then(function (again) {
+      var after = StatementParser.parse(again.map(function (p) { return p.items; }), cleanLabel);
+      var same = after.rows.length === before.rows.length && after.balanced === before.balanced &&
+        after.rows.every(function (r, k) {
+          var o = before.rows[k];
+          return r.d === o.d && r.a === o.a && classify(r.l, r.a) === classify(o.l, o.a);
+        });
+      var left = Anonymizer.leaks(again, m.secrets);
+      var rest = Anonymizer.residual(again);
+      if (left.length || rest.length) throw new Error('des informations personnelles subsistent, le fichier n\'est pas proposé.');
+      if (!same) throw new Error('le relevé anonymisé ne se relit pas à l\'identique, le fichier n\'est pas proposé.');
+      return { blob: blob, ops: before.rows.length, balanced: before.balanced, masked: m.secrets.length };
+    });
+  });
+}
+
+document.getElementById('pdfAnon').addEventListener('change', function (e) {
+  var input = e.target;
+  var file = input.files && input.files[0];
+  var out = document.getElementById('anonout');
+  out.innerHTML = '';
+  if (!file) return;
+  setMsg('Anonymisation de ' + file.name + '…');
+  anonymizeStatement(file).then(function (res) {
+    var name = 'anonyme-' + file.name.replace(/\.pdf$/i, '').replace(/[-_]?\d{10,}$/, '') + '.pdf';
+    var f = new File([res.blob], name, { type: 'application/pdf' });
+    setMsg('Relevé anonymisé : identité, coordonnées bancaires et numéros techniques remplacés par XXXX. Les ' + res.ops + ' opérations se relisent à l\'identique' + (res.balanced ? ', soldes vérifiés.' : '.'));
+    var b = document.createElement('button');
+    b.type = 'button'; b.className = 'btn primary'; b.textContent = 'Enregistrer ou partager le PDF anonymisé';
+    b.addEventListener('click', function () {
+      if (navigator.canShare && navigator.canShare({ files: [f] })) {
+        navigator.share({ files: [f], title: name }).catch(function () {});
+        return;
+      }
+      if (anonUrl) URL.revokeObjectURL(anonUrl);
+      anonUrl = URL.createObjectURL(f);
+      var a = document.createElement('a');
+      a.href = anonUrl; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+    out.appendChild(b);
+  }, function (err) {
+    setMsg(file.name + ' : anonymisation impossible (' + (err && err.message ? err.message : 'erreur inconnue') + ').');
+  }).then(function () { input.value = ''; });
 });
 
 document.getElementById('exportBtn').addEventListener('click', function () {
