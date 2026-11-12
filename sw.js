@@ -1,5 +1,5 @@
-var CACHE = 'budget-v1';
-var ASSETS = ["./", "index.html", "manifest.webmanifest", "icon-192.png", "icon-512.png", "apple-touch-icon.png", "ibm-plex-mono-latin-400-normal.woff2", "ibm-plex-mono-latin-500-normal.woff2", "schibsted-grotesk-latin-400-normal.woff2", "schibsted-grotesk-latin-500-normal.woff2", "schibsted-grotesk-latin-600-normal.woff2", "schibsted-grotesk-latin-700-normal.woff2", "schibsted-grotesk-latin-800-normal.woff2"];
+var CACHE = 'budget-v2';
+var ASSETS = ["./", "index.html", "manifest.webmanifest", "icon-192.png", "icon-512.png", "apple-touch-icon.png", "pdf.min.js", "pdf.worker.min.js", "ibm-plex-mono-latin-400-normal.woff2", "ibm-plex-mono-latin-500-normal.woff2", "schibsted-grotesk-latin-400-normal.woff2", "schibsted-grotesk-latin-500-normal.woff2", "schibsted-grotesk-latin-600-normal.woff2", "schibsted-grotesk-latin-700-normal.woff2", "schibsted-grotesk-latin-800-normal.woff2"];
 
 self.addEventListener('install', function (e) {
   e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(ASSETS); }).then(function () { return self.skipWaiting(); }));

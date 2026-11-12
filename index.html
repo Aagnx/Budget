@@ -155,7 +155,7 @@ header h1 { margin: 2px 0 0; font-size: 28px; font-weight: 800; letter-spacing: 
 .tools { display: flex; flex-wrap: wrap; gap: 8px; }
 .btn { border: 1px solid var(--line); background: var(--surface); border-radius: 10px; padding: 9px 14px; cursor: pointer; font-weight: 500; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
-.msg { min-height: 1.4em; font-size: 14px; margin: 8px 0 0; color: var(--muted); }
+.msg { min-height: 1.4em; font-size: 14px; margin: 8px 0 14px; color: var(--muted); white-space: pre-line; }
 .foot { color: var(--muted); font-size: 13px; }
 .foot p { margin: 0 0 6px; }
 input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
@@ -184,7 +184,9 @@ input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; poin
   <section class="card">
     <h2>Mettre à jour</h2>
     <div class="tools">
-      <label class="btn primary" for="csv" id="csvlabel">Importer un CSV</label>
+      <label class="btn primary" for="pdf">Importer un relevé PDF</label>
+      <input type="file" id="pdf" accept=".pdf,application/pdf" multiple>
+      <label class="btn" for="csv" id="csvlabel">Importer un CSV</label>
       <input type="file" id="csv" accept=".csv,text/csv,text/plain">
       <button class="btn" type="button" id="resetBudgets">Budgets proposés</button>
       <button class="btn" type="button" id="resetImports">Effacer les imports</button>
@@ -194,7 +196,7 @@ input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; poin
     </div>
     <p class="msg" id="msg" role="status"></p>
     <div class="foot">
-      <p>Export attendu : CSV des mouvements de ta banque (colonnes dateOp, label, amount). Les lignes déjà présentes sont ignorées.</p>
+      <p>Relevés PDF Boursobank, ou export CSV (colonnes dateOp, label, amount) : les opérations déjà présentes sont ignorées. Pour un PDF, l'application vérifie que le total correspond aux soldes du relevé.</p>
       <p>Hors budget : les transferts entre tes comptes et les virements avec des proches. Si l'un d'eux est une vraie dépense, reclasse-le depuis sa ligne.</p>
       <p>Tout reste sur ce téléphone : aucune donnée n'est envoyée sur internet. Pense à exporter une sauvegarde de temps en temps.</p>
     </div>
@@ -231,7 +233,7 @@ var CATS = [
 // Première règle qui correspond l'emporte. Libellés comparés en majuscules.
 var RULES = [
   [/MNCAP/, 'Assurance prêt'],
-  [/VIR INST GINIOUX ANTOINE DEPUIS BOURSOBANK/, 'Échéance prêt', function (a) { return a <= -970 && a >= -990; }],
+  [/VIR INST GINIOUX ANTOINE.*DEPUIS BOURSOBANK/, 'Échéance prêt', function (a) { return a <= -970 && a >= -990; }],
   [/LIVRET D'EPARGNE|DEPUIS BOURSOBANK|VIR INST (ANTOINE GINIOUX|GINIOUX ANTOINE)|CREATION COMPTE|CLOTURE COMPTE|COMPTE DE PASSA/, 'Transferts internes'],
   [/SALAIRE/, 'Salaire'],
   [/DGFIP/, 'Remboursement impôt'],
@@ -615,14 +617,7 @@ document.getElementById('csv').addEventListener('change', function (e) {
   reader.onload = function () {
     try {
       var rows = parseCSV(String(reader.result));
-      var have = {};
-      base.concat(extra).forEach(function (r) { var k = r.d + '|' + r.l + '|' + r.a.toFixed(2); have[k] = (have[k] || 0) + 1; });
-      var local = {}, added = 0;
-      rows.forEach(function (r) {
-        var k = r.d + '|' + r.l + '|' + r.a.toFixed(2);
-        local[k] = (local[k] || 0) + 1;
-        if (local[k] > (have[k] || 0)) { extra.push(r); added++; }
-      });
+      var added = mergeRows(rows);
       save(K.extra, extra);
       setMsg(added + ' opération' + (added > 1 ? 's' : '') + ' ajoutée' + (added > 1 ? 's' : '') + ', ' + (rows.length - added) + ' déjà présente' + (rows.length - added > 1 ? 's' : '') + '.');
       render();
@@ -640,6 +635,233 @@ document.getElementById('resetBudgets').addEventListener('click', function () {
 });
 document.getElementById('resetImports').addEventListener('click', function () {
   extra = []; save(K.extra, extra); setMsg('Imports effacés. Les relevés de départ restent.'); render();
+});
+// Lecture des relevés de compte Boursobank (PDF). Reçoit, pour chaque page, la liste des morceaux de texte
+// { s: texte, x, y, w } et renvoie les opérations, les soldes et un contrôle de cohérence.
+var StatementParser = (function () {
+  var DATE = /^\d{2}\/\d{2}\/\d{4}$/;
+  var AMOUNT = /^-?\d{1,3}(?:\.\d{3})*,\d{2}$|^-?\d+,\d{2}$/;
+  var FOOTER = /^(Montant frais|Nouveau solde|A r[ée]ception|A d[ée]faut|\*|Mod\.|Boursorama|Service|Adresse)/i;
+
+  function toNumber(s) { return parseFloat(String(s).replace(/\./g, '').replace(',', '.')); }
+  function toIso(s) { return s.slice(6, 10) + '-' + s.slice(3, 5) + '-' + s.slice(0, 2); }
+  function cents(n) { return Math.round(n * 100); }
+
+  function groupLines(items) {
+    var sorted = items.slice().sort(function (a, b) { return (b.y - a.y) || (a.x - b.x); });
+    var lines = [];
+    sorted.forEach(function (it) {
+      var last = lines[lines.length - 1];
+      if (last && Math.abs(last.y - it.y) <= 3) last.items.push(it);
+      else lines.push({ y: it.y, items: [it] });
+    });
+    lines.forEach(function (l) { l.items.sort(function (a, b) { return a.x - b.x; }); });
+    return lines;
+  }
+
+  function lineText(line) { return line.items.map(function (i) { return i.s.trim(); }).join(' ').replace(/\s+/g, ' ').trim(); }
+
+  function valueDateOf(line) {
+    for (var i = 1; i < line.items.length; i++) {
+      if (DATE.test(line.items[i].s.trim()) && line.items[i].x > 300) return line.items[i];
+    }
+    return null;
+  }
+
+  function isRow(line) {
+    var first = line.items[0];
+    return !!first && DATE.test(first.s.trim()) && first.x < 70 && !!valueDateOf(line);
+  }
+
+  function lastAmount(line, minX) {
+    var found = null;
+    line.items.forEach(function (i) { if (i.x >= minX && AMOUNT.test(i.s.trim())) found = i; });
+    return found;
+  }
+
+  function cleanContinuation(text) {
+    if (/^(R[èe]f|RUM)\b/i.test(text)) return '';
+    return text.split(/\s+/).filter(function (t) { return t && !/\d{5,}/.test(t); }).join(' ');
+  }
+
+  function parse(pages, clean) {
+    var rows = [], unparsed = 0, opening = null, closing = null, periodEnd = null;
+    pages.forEach(function (items) {
+      var lines = groupLines(items);
+      var boundary = 499;
+      var deb = null, cre = null;
+      items.forEach(function (i) { if (i.s.trim() === 'Débit') deb = i; if (i.s.trim() === 'Crédit') cre = i; });
+      if (deb && cre) boundary = ((deb.x + deb.w) + (cre.x + cre.w)) / 2;
+      var current = null;
+
+      function finish() {
+        if (!current) return;
+        var main = current.label.join(' ').replace(/\s+/g, ' ').trim();
+        main = clean(main).replace(/\b\d{2}\/\d{2}\/\d{2}\b/g, ' ').replace(/\s+/g, ' ').trim();
+        var extra = current.cont.map(cleanContinuation).filter(Boolean).slice(0, 2);
+        var label = [main].concat(extra).join(' ').trim();
+        if (current.amount === null) { unparsed++; } else { rows.push({ d: current.d, l: label, a: current.amount }); }
+        current = null;
+      }
+
+      lines.forEach(function (line) {
+        var text = lineText(line);
+        var m = text.match(/du (\d{2}\/\d{2}\/\d{4}) au (\d{2}\/\d{2}\/\d{4})/);
+        if (m) periodEnd = m[2];
+        if (isRow(line)) {
+          finish();
+          var date = line.items[0];
+          var val = valueDateOf(line);
+          var label = [], amount = null;
+          line.items.forEach(function (i, idx) {
+            if (idx === 0 || i === val) return;
+            if (i.x > date.x + 2 && i.x < val.x - 2) label.push(i.s.trim());
+            else if (i.x >= val.x + val.w - 1 && AMOUNT.test(i.s.trim()) && amount === null) {
+              var v = toNumber(i.s.trim());
+              amount = (i.x + i.w) < boundary ? -Math.abs(v) : Math.abs(v);
+            }
+          });
+          current = { d: toIso(date.s.trim()), label: label, amount: amount, cont: [] };
+        } else if (/SOLDE AU/.test(text)) {
+          finish();
+          var a = lastAmount(line, 480);
+          if (a && opening === null) opening = toNumber(a.s.trim());
+        } else if (/Nouveau solde/i.test(text)) {
+          finish();
+          var c = lastAmount(line, 480);
+          if (c) closing = toNumber(c.s.trim());
+        } else if (current && line.y > 105 && line.items[0].x >= 100 && line.items[0].x <= 135 && !FOOTER.test(text)) {
+          current.cont.push(text);
+        }
+      });
+      finish();
+    });
+    var sum = 0;
+    rows.forEach(function (r) { sum += cents(r.a); });
+    var balanced = null, diff = null;
+    if (opening !== null && closing !== null) {
+      diff = (cents(opening) + sum - cents(closing)) / 100;
+      balanced = diff === 0 && unparsed === 0;
+    }
+    return { rows: rows, opening: opening, closing: closing, sum: sum / 100, balanced: balanced, diff: diff, unparsed: unparsed, periodEnd: periodEnd };
+  }
+
+  return { parse: parse };
+})();
+
+if (typeof module !== 'undefined') module.exports = StatementParser;
+
+// ---------- Import des relevés PDF ----------
+// Une opération est considérée comme déjà présente si une opération de même date et de même montant existe.
+function mergeRows(rows) {
+  var have = {};
+  base.concat(extra).forEach(function (r) { var k = r.d + '|' + r.a.toFixed(2); have[k] = (have[k] || 0) + 1; });
+  var seen = {}, added = 0;
+  rows.forEach(function (r) {
+    var k = r.d + '|' + r.a.toFixed(2);
+    seen[k] = (seen[k] || 0) + 1;
+    if (seen[k] > (have[k] || 0)) { extra.push(r); added++; }
+  });
+  return added;
+}
+
+function pl(n, one, many) { return n + ' ' + (n > 1 ? many : one); }
+
+var pdfLib = null;
+function loadPdfJs() {
+  if (pdfLib) return Promise.resolve(pdfLib);
+  return new Promise(function (resolve, reject) {
+    var s = document.createElement('script');
+    s.src = 'pdf.min.js';
+    s.onload = function () {
+      if (!window.pdfjsLib) { reject(new Error('lecteur PDF indisponible')); return; }
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.min.js';
+      pdfLib = window.pdfjsLib;
+      resolve(pdfLib);
+    };
+    s.onerror = function () { reject(new Error('lecteur PDF introuvable : ouvre l\'application une fois avec internet')); };
+    document.head.appendChild(s);
+  });
+}
+
+function readPages(file) {
+  return loadPdfJs().then(function (lib) {
+    return file.arrayBuffer().then(function (buf) {
+      return lib.getDocument({ data: new Uint8Array(buf) }).promise;
+    });
+  }).then(function (doc) {
+    var pages = [], chain = Promise.resolve();
+    for (var n = 1; n <= doc.numPages; n++) {
+      (function (num) {
+        chain = chain.then(function () { return doc.getPage(num); })
+          .then(function (page) { return page.getTextContent(); })
+          .then(function (tc) {
+            pages.push(tc.items.filter(function (i) { return i.str && i.str.trim(); }).map(function (i) {
+              return { s: i.str, x: i.transform[4], y: i.transform[5], w: i.width };
+            }));
+          });
+      })(n);
+    }
+    return chain.then(function () { return pages; });
+  });
+}
+
+function importStatement(file) {
+  return readPages(file).then(function (pages) {
+    var r = StatementParser.parse(pages, cleanLabel);
+    var title = 'Relevé' + (r.periodEnd ? ' au ' + r.periodEnd : ' ' + file.name);
+    if (!r.rows.length) return { text: title + ' : aucune opération reconnue (relevé de compte Boursobank attendu).', added: 0 };
+    if (r.balanced === false) {
+      var why = r.unparsed ? pl(r.unparsed, 'ligne illisible', 'lignes illisibles') : 'écart de ' + f2.format(r.diff);
+      return { text: title + ' : non importé, le total des opérations ne correspond pas aux soldes du relevé (' + why + ').', added: 0 };
+    }
+    var added = mergeRows(r.rows);
+    var check = r.balanced === true ? ' Soldes vérifiés.' : ' Soldes introuvables, total non vérifié.';
+    return { text: title + ' : ' + pl(r.rows.length, 'opération lue', 'opérations lues') + '.' + check + ' ' + pl(added, 'ajoutée', 'ajoutées') + ', ' + pl(r.rows.length - added, 'déjà présente', 'déjà présentes') + '.', added: added };
+  });
+}
+
+document.getElementById('pdf').addEventListener('change', function (e) {
+  var input = e.target;
+  var files = Array.prototype.slice.call(input.files || []);
+  if (!files.length) return;
+  setMsg('Lecture de ' + pl(files.length, 'relevé', 'relevés') + '…');
+  var lines = [], total = 0;
+  files.reduce(function (chain, file) {
+    return chain.then(function () { return importStatement(file); }).then(function (res) {
+      lines.push(res.text); total += res.added;
+    }, function (err) {
+      lines.push(file.name + ' : lecture impossible (' + (err && err.message ? err.message : 'erreur inconnue') + ').');
+    });
+  }, Promise.resolve()).then(function () {
+    if (total > 0 && !base.length && !Object.keys(userBudgets).length) proposeBudgetsFromExtra();
+    save(K.extra, extra);
+    if (total > 0) sel = null;
+    setMsg(lines.join('\n'));
+    input.value = '';
+    render();
+  });
+});
+
+// Sans sauvegarde de départ, les budgets proposés se calculent sur les relevés importés (moyenne mensuelle arrondie à 5 €).
+function proposeBudgetsFromExtra() {
+  var sums = {}, ms = {};
+  extra.forEach(function (r) {
+    ms[r.d.slice(0, 7)] = 1;
+    var c = classify(r.l, r.a);
+    if (kindOf(c) === 'exp') sums[c] = (sums[c] || 0) - r.a;
+  });
+  var n = Object.keys(ms).length || 1;
+  CATS.forEach(function (c) {
+    if (c.kind !== 'exp') return;
+    var v = (sums[c.id] || 0) / n;
+    if (!NOBUDGET[c.id] && v >= 5) userBudgets[c.id] = Math.round(v / 5) * 5;
+  });
+  save(K.budgets, userBudgets);
+}
+
+document.getElementById('resetBudgets').addEventListener('click', function () {
+  if (!base.length && extra.length) { proposeBudgetsFromExtra(); render(); }
 });
 
 document.getElementById('exportBtn').addEventListener('click', function () {
